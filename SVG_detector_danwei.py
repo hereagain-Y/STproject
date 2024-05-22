@@ -85,7 +85,7 @@ class SvgDetector:
     
     
     
-    def cauchy_combination_test(p_values):
+    def cauchy_combination_test(self, p_values):
         # Step 1: Convert p-values to Cauchy-distributed test statistics
         cauchy_stats = np.tan(np.pi * (p_values - 0.5))
         
@@ -123,7 +123,7 @@ class SvgDetector:
         self.coord['y_bin'] = np.floor((self.coord['y'] - y_min - y_bin_size / 2) / y_bin_size) + 1
         self.coord['xy_bin'] = self.coord['x_bin'].astype(str) + "_" + self.coord['y_bin'].astype(str)
 
-        df = pd.concat([self.coord['xy_bin'], count], axis=1)
+        df = pd.concat([self.coord['xy_bin'], self.count], axis=1)
         grouped_df = df.groupby(['xy_bin']).sum().reset_index()
         grouped_df.drop(['xy_bin'], axis=1, inplace=True)
         grouped_df = grouped_df.loc[grouped_df.sum(axis=1) != 0]
@@ -180,7 +180,7 @@ class SvgDetector:
             for d in distributions:
                 p_value.loc[i, f'logp_{d}'] = logp_values[d]
                 if method == 'cauchy':
-                    p_value.loc[i, f'cauchy_{d}'] =self. cauchy_combination_test(np.array(cauchy_values[d]))
+                    p_value.loc[i, f'cauchy_{d}'] =self.cauchy_combination_test(np.array(cauchy_values[d]))
 
         # Select and return the relevant columns based on 'dist' and 'method' parameters
         relevant_cols = ['gene']
@@ -201,20 +201,23 @@ class SvgDetector:
             result = self.run_SVG(genes, size, size, filter, method, dist)
             result = result.rename(columns={col: f'{col}_{size}' for col in result.columns if col != 'gene'})
             results.append(result)
+            
+        comprehensive_result = pd.concat(results, axis=1)
+        comprehensive_result = comprehensive_result.loc[:,~comprehensive_result.columns.duplicated()]
 
-        # Combine all results into one DataFrame
-        comprehensive_result = reduce(lambda left, right: pd.merge(left, right, on='gene', how='outer'), results)
 
         # Calculate ranks for each grid size and the average rank
         for size in grid_sizes:
-            comprehensive_result[f'rank_{size}'] = comprehensive_result[f'logp_{dist}_{size}'].rank(method='min', ascending=False)
+            comprehensive_result[f'rank_{size}'] = comprehensive_result[f'{method}_{dist}_{size}'].rank(method='min', ascending=False)
         
         rank_columns = [f'rank_{size}' for size in grid_sizes]
         comprehensive_result['average_rank'] = comprehensive_result[rank_columns].mean(axis=1)
+        comprehensive_result['final_rank'] = comprehensive_result['average_rank'].rank(method='min').astype(int)
 
         # Select and order the columns appropriately
-        result_columns = ['gene'] + [f'logp_{dist}_{size}' for size in grid_sizes] + rank_columns + ['average_rank']
+        result_columns = ['gene'] + [f'{method}_{dist}_{size}' for size in grid_sizes] +  ['final_rank']
         comprehensive_result = comprehensive_result[result_columns]
+        comprehensive_result = comprehensive_result.sort_values('final_rank')
         return comprehensive_result
         
         
@@ -225,9 +228,9 @@ class SvgDetector:
             
     def gene_expression_plot(self,gene,method,path):
         cmap = plt.get_cmap('plasma')
-        df = self.count[[gene,'x','y']]
+        #df = self.count[[gene,'x','y']]
         norm = mcolors.Normalize(vmin=self.count[gene].min(), vmax=self.count[gene].max())
-        scatter = plt.scatter(df['x'], df['y'], c=df[gene], cmap=cmap, norm=norm, s=8)
+        scatter = plt.scatter(self.coord['x'], self.coord['y'], c=self.count[gene], cmap=cmap, norm=norm, s=8)
         plt.colorbar(scatter, label='Gene Expression Level')
 
         # Formatting the plot
