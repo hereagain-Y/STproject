@@ -13,9 +13,11 @@ import gzip
 from scipy.io import mmread
 from statsmodels.discrete.count_model import ZeroInflatedPoisson, Poisson
 from statsmodels.tools import add_constant
-from scipy.stats import norm
 from scipy.stats import expon
+import scipy.stats as stats
+from scipy.stats import poisson, norm,nbinom,gamma
 import matplotlib.colors as mcolors
+from functools import reduce
 
 class SvgDetector:
     """
@@ -83,63 +85,144 @@ class SvgDetector:
     
     
     
-    def run_SVG(self,count_data,gene_list,base):
-    
-        y_bin_size =120*base
-        x_bin_size =140*base
+    def cauchy_combination_test(p_values):
+        # Step 1: Convert p-values to Cauchy-distributed test statistics
+        cauchy_stats = np.tan(np.pi * (p_values - 0.5))
+        
+        # Step 2: Calculate the combined test statistic (median of Cauchy stats)
+        combined_stat = np.median(cauchy_stats)
+        
+        # Step 3: Calculate the combined p-value
+        combined_p_value = stats.cauchy.cdf(combined_stat)
+        
+        # Adjust the p-value since the Cauchy distribution is symmetric around 0
+        # We take the min of the calculated p-value and 1 minus that value to ensure the p-value is correctly oriented
+        combined_p_value = min(combined_p_value, 1 - combined_p_value) * 2
+        return combined_p_value
 
-        # Calculate the min and max values for x and y
+    def run_SVG(self, genes, grid_size, base, filter=False, method='default', dist='gamma'):
+        '''
+        ## input of function:  - count_data: DataFrame with gene expression counts.
+        #                      - coord_data: DataFrame with x and y coordinates.
+        # genes: list of genes to run the SVG test on
+        # grid_size: size of the grid to bin the data into
+        # base: base value for the grid size
+        # filter: boolean to filter out outliers
+        # method: method to use for the SVG test ('default logp ' or 'cauchy')
+        # dist: distribution to use for the SVG test ('gamma', 'normal', 'poisson', 'nb', or 'all')
+        Output: DataFrame with p-values for each gene based on the SVG test, colnames as genes, cauchy_{d} or logp_{d}. 
+        '''
+        
+        y_bin_size = grid_size * base
+        x_bin_size = grid_size * base
+
         x_min, x_max = self.coord['x'].min(), self.coord['x'].max()
         y_min, y_max = self.coord['y'].min(), self.coord['y'].max()
-        x_bins = int((x_max - x_min) / x_bin_size) + 1
-        y_bins = int((y_max - y_min) / y_bin_size) + 1
 
-        # Re-assign each data point to a bin
-        self.coord['x_bin'] = (self.coord['x']-x_min - x_bin_size/2 )//x_bin_size +1
-        self.coord['y_bin'] = (self.coord['y']-y_min - y_bin_size/2 )//y_bin_size +1
-
+        self.coord['x_bin'] = np.floor((self.coord['x'] - x_min - x_bin_size / 2) / x_bin_size) + 1
+        self.coord['y_bin'] = np.floor((self.coord['y'] - y_min - y_bin_size / 2) / y_bin_size) + 1
         self.coord['xy_bin'] = self.coord['x_bin'].astype(str) + "_" + self.coord['y_bin'].astype(str)
 
-        self.coord['cnt'] = 1
-
-
-        # Group by bins and cell type to aggregate the expression values
-        grouped = self.coord.groupby(['x_bin', 'y_bin']).agg({'cnt':'count'}).reset_index()
-
-
-        # Create a new dataframe with the binned data
-        df = pd.concat([self.coord['xy_bin'] ,count_data], axis=1)
+        df = pd.concat([self.coord['xy_bin'], count], axis=1)
         grouped_df = df.groupby(['xy_bin']).sum().reset_index()
-        
         grouped_df.drop(['xy_bin'], axis=1, inplace=True)
-        # exclude blank bins: row sum is 0 
-        grouped_df.loc[grouped_df.sum(axis=1)!=0]
-        # calculate the mean of each gene
+        grouped_df = grouped_df.loc[grouped_df.sum(axis=1) != 0]
+
         lambda_values = grouped_df.mean()
         sd = grouped_df.std()
-        self.read_counts = {col: grouped_df[col].value_counts() for col in grouped_df.columns}
+        Q1 = grouped_df.quantile(0.25)
+        Q3 = grouped_df.quantile(0.75)
+        IQR = Q3 - Q1
+        read_counts = {col: grouped_df[col].value_counts() for col in grouped_df.columns}
+        variance = sd**2
 
+        p_value = pd.DataFrame(genes, columns=['gene'])
+        distributions = ['gamma', 'normal', 'poisson', 'nb'] if dist == 'all' else [dist]
 
-        p_value = pd.DataFrame(gene_list,columns=['gene'])
-        p_value['logp'] = [0]*len(gene_list)
+        for d in distributions:
+            p_value[f'logp_{d}'] = [0] * len(genes)
+            if method == 'cauchy':
+                p_value[f'cauchy_{d}'] = [0] * len(genes)  # Ensure cauchy values are created for any 'cauchy' method
 
-        for i in  tqdm(range(len(gene_list))):
-            gene = gene_list[i]
-            logp = 0
-            for bin_number, count in self.read_counts[gene].items():
-                if count ==0:
-                    count += 0.1
-                up = lambda_values[gene]+ 3*sd[gene]
-                down = max(lambda_values[gene]- 3*sd[gene],0)
-            
-                # fit an exponential distribution to the data
-                if down<=count<=up:
-                    rate_param = 1 / lambda_values[gene]  # Adjust according to your data's characteristics
-                    logp += np.log(expon.pdf(count, scale=1/rate_param))
-            p_value.loc[i,'logp'] = logp
-            
+        for i in tqdm(range(len(genes))):
+            gene = genes[i]
+            logp_values = {d: 0 for d in distributions}
+            cauchy_values = {d: [] for d in distributions}
+
+            upper = Q3[gene] + 1.5 * IQR[gene]
+            lower = Q1[gene] - 1.5 * IQR[gene]
+
+            for count, bin_number in read_counts[gene].items():
+                count = count if count != 0 else 0.1
+                if not filter or (lower <= count <= upper):
+                    for d in distributions:
+                        if d == 'gamma':
+                            k = lambda_values[gene]**2 / variance[gene]
+                            theta = variance[gene] / lambda_values[gene]
+                            pdf_value = gamma.pdf(count, a=k, scale=theta)
+                        elif d == 'normal':
+                            mu = lambda_values[gene]
+                            sigma = np.sqrt(variance[gene])
+                            pdf_value = norm.pdf(count, loc=mu, scale=sigma)
+                        elif d == 'poisson':
+                            mu = lambda_values[gene]
+                            pdf_value = poisson.pmf(count, mu=mu)
+                        elif d == 'nb':
+                            mu = lambda_values[gene]
+                            sigma_squared = variance[gene]
+                            r = mu**2 / (sigma_squared - mu) if sigma_squared > mu else 1
+                            p = mu / sigma_squared if sigma_squared > mu else 0.5
+                            pdf_value = nbinom.pmf(count, r, p/(p+1)) 
+                        logp_values[d] += bin_number * np.log(pdf_value + 1e-10)
+                        if method == 'cauchy':
+                            cauchy_values[d].extend([pdf_value] * bin_number)
+
+            for d in distributions:
+                p_value.loc[i, f'logp_{d}'] = logp_values[d]
+                if method == 'cauchy':
+                    p_value.loc[i, f'cauchy_{d}'] =self. cauchy_combination_test(np.array(cauchy_values[d]))
+
+        # Select and return the relevant columns based on 'dist' and 'method' parameters
+        relevant_cols = ['gene']
+        if method == 'default':
+            relevant_cols.extend([f'logp_{d}' for d in distributions])
+        elif method == 'cauchy':
+            relevant_cols.extend([f'cauchy_{d}' for d in distributions])
+
+        p_value = p_value[relevant_cols]
+
         return p_value
+
+    def run_comprehensive_SVG(self, genes, filter=False, method='default', dist='gamma'):
+        results = []
+        grid_sizes = [1, 2, 3, 4, 5, 6]
+        # Run run_SVG for each grid size and append results to a list
+        for size in grid_sizes:
+            result = self.run_SVG(genes, size, size, filter, method, dist)
+            result = result.rename(columns={col: f'{col}_{size}' for col in result.columns if col != 'gene'})
+            results.append(result)
+
+        # Combine all results into one DataFrame
+        comprehensive_result = reduce(lambda left, right: pd.merge(left, right, on='gene', how='outer'), results)
+
+        # Calculate ranks for each grid size and the average rank
+        for size in grid_sizes:
+            comprehensive_result[f'rank_{size}'] = comprehensive_result[f'logp_{dist}_{size}'].rank(method='min', ascending=False)
         
+        rank_columns = [f'rank_{size}' for size in grid_sizes]
+        comprehensive_result['average_rank'] = comprehensive_result[rank_columns].mean(axis=1)
+
+        # Select and order the columns appropriately
+        result_columns = ['gene'] + [f'logp_{dist}_{size}' for size in grid_sizes] + rank_columns + ['average_rank']
+        comprehensive_result = comprehensive_result[result_columns]
+        return comprehensive_result
+        
+        
+        
+        
+
+        
+            
     def gene_expression_plot(self,gene,method,path):
         cmap = plt.get_cmap('plasma')
         df = self.count[[gene,'x','y']]
